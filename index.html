@@ -127,6 +127,33 @@
     white-space: pre-wrap;
     word-break: break-all;
   }
+
+  /* ---- Developer mode ---- */
+  :root { --c-x: #d1453b; --c-y: #2e8b57; --c-z: #1f6feb; --c-mag: #8a8f98; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --c-x: #ff7b72; --c-y: #56d364; --c-z: #79c0ff; --c-mag: #a0a8b3; }
+  }
+  :root[data-theme="dark"] { --c-x: #ff7b72; --c-y: #56d364; --c-z: #79c0ff; --c-mag: #a0a8b3; }
+
+  .devtoggle { display: flex; align-items: center; gap: 8px; margin-top: 16px; color: var(--muted); font-size: 0.9rem; }
+  .dev[hidden] { display: none; }
+  .dev h2 { font-size: 1.05rem; margin: 0 0 10px; }
+  .dev-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .dev-row label { color: var(--muted); font-size: 0.9rem; }
+  .dev select, .dev input[type="file"] {
+    font: inherit; font-size: 0.95rem; color: var(--text); background: var(--card);
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; max-width: 100%;
+  }
+  .dev-src { color: var(--muted); font-size: 0.85rem; word-break: break-all; }
+  .dev-summary { font-size: 0.9rem; margin: 8px 0; white-space: pre-wrap; }
+  .dev-summary.err { color: var(--danger); }
+  #chart { width: 100%; margin: 8px 0; overflow: hidden; }
+  .dev .u-legend { font-size: 0.8rem; color: var(--text); }
+  .dev .chart-note { color: var(--muted); font-size: 0.8rem; margin-bottom: 8px; }
+  .table-wrap { max-height: 320px; overflow: auto; margin-top: 8px; }
+  .dev table { border-collapse: collapse; width: 100%; font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+  .dev th, .dev td { padding: 4px 6px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap; }
+  .dev th { position: sticky; top: 0; background: var(--card); color: var(--muted); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -167,6 +194,39 @@
     <summary>Activity log</summary>
     <pre id="log"></pre>
   </details>
+
+  <label class="devtoggle"><input type="checkbox" id="devMode"> Developer mode</label>
+
+  <div class="card dev" id="dev" hidden>
+    <h2>Decode &amp; graph</h2>
+    <div class="dev-row">
+      <label for="devRange">Accelerometer range</label>
+      <select id="devRange">
+        <option value="2">±2 g</option>
+        <option value="4">±4 g</option>
+        <option value="8" selected>±8 g</option>
+        <option value="16">±16 g</option>
+      </select>
+    </div>
+    <div class="dev-row">
+      <label for="devFile">Open a saved .bin</label>
+      <input type="file" id="devFile" accept=".bin,application/octet-stream">
+    </div>
+    <div class="dev-src" id="devSrc">Download a log, or open a saved .bin.</div>
+    <div class="dev-summary" id="devSummary"></div>
+    <div class="chart-note" id="chartNote" hidden>
+      Drag across the graph to zoom, double-tap/click to reset. Bursts are 10 s every 60 s.
+      Dashed lines are reboots: the clock restarts there, so the time between them is unknown (drawn as 60 s).
+    </div>
+    <div id="chart"></div>
+    <div class="buttons">
+      <button id="devCsv" disabled>Export CSV</button>
+    </div>
+    <details id="devTableWrap" hidden>
+      <summary id="devTableSummary">Bursts</summary>
+      <div class="table-wrap" id="devTable"></div>
+    </details>
+  </div>
 </main>
 
 <script>
@@ -357,6 +417,7 @@ async function download() {
     log(`Received ${total} bytes in ${count} notifications, ${secs.toFixed(1)} s`);
     showLogHeader(data);
     saveBin(data);
+    devSetSource(data, tagNumber(device && device.name), `last download (${fileName()})`);
     downloadedThisConnection = true;
     setStatus(`Downloaded ${fmtKB(total)}${device.gatt.connected ? "" : " (tag disconnected at the end)"}.`, "ok");
   } catch (e) {
@@ -509,6 +570,340 @@ async function deleteLog() {
   }
 }
 
+/* ---- Developer mode: decoder --------------------------------------------- */
+/* Same format and logic as tools/decode_log.py in the firmware repo.
+ * Log header 16 B: u32 magic, u32 timestamp s, u32 reset_cause, u16 boot_count,
+ * u8 version, u8 session. Then bursts: 14-byte header (u32 timestamp ms,
+ * u16 sequence, u16 length, u16 widths wx|wy<<4|wz<<8, u8 failed_reads,
+ * u8 failed_writes, u8 restarted, i8 temperature), an MSB-first bitstream
+ * (first sample x,y,z as 16 bits each, then 99 zigzag 12-bit-wrap deltas per
+ * axis at wx/wy/wz bits), 0xFF padding to a multiple of 16. A probe dump ends
+ * with F0 0D BA BE x4; a download just ends. */
+// DECODER-BEGIN
+const END_MARKER = [0xF0, 0x0D, 0xBA, 0xBE, 0xF0, 0x0D, 0xBA, 0xBE,
+                    0xF0, 0x0D, 0xBA, 0xBE, 0xF0, 0x0D, 0xBA, 0xBE];
+const SAMPLES_PER_BURST = 100;
+const BURST_HEADER_SIZE = 14;
+const FAILED_READ = -2048;
+
+function wrap12(v) { return ((v + 2048) & 0xFFF) - 2048; }
+
+function decodeBurst(bytes, start, w) {
+  let pos = 0;                                   /* bit position from start */
+  const get = (width) => {
+    let v = 0;
+    for (let k = 0; k < width; k++) {
+      const byte = bytes[start + (pos >> 3)];
+      v = (v << 1) | ((byte >> (7 - (pos & 7))) & 1);
+      pos++;
+    }
+    return v;
+  };
+  const s = new Int16Array(SAMPLES_PER_BURST * 3);   /* x,y,z interleaved */
+  for (let a = 0; a < 3; a++) {
+    const v = get(16);
+    s[a] = (v & 0x8000) ? v - 0x10000 : v;
+  }
+  for (let i = 1; i < SAMPLES_PER_BURST; i++) {
+    for (let a = 0; a < 3; a++) {
+      const u = get(w[a]);
+      const d = (u >>> 1) ^ -(u & 1);            /* un-zigzag */
+      s[i * 3 + a] = wrap12(s[(i - 1) * 3 + a] + d);
+    }
+  }
+  return s;
+}
+
+function decodeLog(bytes) {
+  const len = bytes.length;
+  if (len < 16) throw new Error(`only ${len} bytes, no log header`);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, len);
+  const magic = dv.getUint32(0, true);
+  if (magic !== 0xCAFEBABE) {
+    throw new Error(`no log header (magic 0x${magic.toString(16).toUpperCase().padStart(8, "0")})`);
+  }
+  const header = {
+    timestamp: dv.getUint32(4, true), reset_cause: dv.getUint32(8, true),
+    boot_count: dv.getUint16(12, true), version: dv.getUint8(14), session: dv.getUint8(15),
+  };
+  const bursts = [];
+  const notes = [];
+  let off = 16;
+  while (off < len) {
+    const rem = Math.min(16, len - off);
+    let isMarker = true;
+    for (let k = 0; k < rem; k++) if (bytes[off + k] !== END_MARKER[k]) { isMarker = false; break; }
+    if (isMarker) break;                         /* end of log (probe dump) */
+    if (off + BURST_HEADER_SIZE > len) { notes.push(`${len - off} trailing bytes at offset ${off} ignored`); break; }
+    const ts = dv.getUint32(off, true), seq = dv.getUint16(off + 4, true);
+    const length = dv.getUint16(off + 6, true), widths = dv.getUint16(off + 8, true);
+    if (length === 0xFFFF || length < 16 || length % 16) {
+      notes.push(`no valid burst at offset ${off} (length ${length}), stopped`); break;
+    }
+    if (off + length > len) {
+      notes.push(`burst seq ${seq} at offset ${off} is cut short (${len - off} of ${length} bytes), ignored`); break;
+    }
+    const w = [widths & 0xF, (widths >> 4) & 0xF, (widths >> 8) & 0xF];
+    const need = BURST_HEADER_SIZE + Math.ceil((48 + 99 * (w[0] + w[1] + w[2])) / 8);
+    if (need > length) {
+      notes.push(`burst seq ${seq} at offset ${off}: widths ${w.join("/")} need ${need} B but length is ${length}, stopped`); break;
+    }
+    bursts.push({
+      offset: off, timestamp_ms: ts, sequence: seq, length, widths: w,
+      failed_reads: dv.getUint8(off + 10), failed_writes: dv.getUint8(off + 11),
+      restarted: dv.getUint8(off + 12) === 0xFF, temperature: dv.getInt8(off + 13),
+      samples: decodeBurst(bytes, off + BURST_HEADER_SIZE, w),
+    });
+    off += length;
+  }
+  /* Boot index per burst: timestamps restart at every boot */
+  let boot = 0, lastTs = null;
+  bursts.forEach((b, i) => {
+    if (i > 0 && (b.restarted || b.timestamp_ms < lastTs)) boot++;
+    b.boot = boot;
+    lastTs = b.timestamp_ms;
+  });
+  return { header, bursts, notes };
+}
+// DECODER-END
+
+/* Driver scale (zephyr lis2dh.c ACCEL_SCALE) in um/s^2 per 12-bit count -> mg */
+const RANGE_SENSITIVITY = { 2: 1600, 4: 3200, 8: 6400, 16: 19200 };
+function mgPerCount(g) {
+  const um = Math.floor(Math.floor(9806650 * RANGE_SENSITIVITY[g] / 16384) / 100);
+  return um / 9806.65;
+}
+
+/* ---- Developer mode: UI -------------------------------------------------- */
+const UPLOT_JS  = "https://cdn.jsdelivr.net/npm/uplot@1.6.30/dist/uPlot.iife.min.js";
+const UPLOT_CSS = "https://cdn.jsdelivr.net/npm/uplot@1.6.30/dist/uPlot.min.css";
+const UPLOT_JS_SRI  = "sha384-1NEYi76CBpge3gahk4+X4M4JzdOV3WYq84RnByqYdAd5SdvJBTNCPFh/nsoHfN6i";
+const UPLOT_CSS_SRI = "sha384-IfV0B7MIOYuO95kO9G5ySKPz/85zqFNOAs8iy4tkK5zd9izhJAB8b7lHrwYqqmYE";
+
+let devSource = null;      /* { bytes, tagNum, label } */
+let devDecoded = null;
+let devPlot = null;
+let uplotPromise = null;
+
+function store(key, value) {
+  try {
+    if (value === undefined) return localStorage.getItem(key);
+    localStorage.setItem(key, value);
+  } catch (_) { /* storage unavailable: fine */ }
+  return null;
+}
+
+function loadUPlot() {
+  if (window.uPlot) return Promise.resolve();
+  if (uplotPromise) return uplotPromise;
+  uplotPromise = new Promise((resolve, reject) => {
+    const css = document.createElement("link");
+    css.rel = "stylesheet"; css.href = UPLOT_CSS; css.integrity = UPLOT_CSS_SRI; css.crossOrigin = "anonymous";
+    document.head.appendChild(css);
+    const js = document.createElement("script");
+    js.src = UPLOT_JS; js.integrity = UPLOT_JS_SRI; js.crossOrigin = "anonymous";
+    js.onload = () => resolve();
+    js.onerror = () => { uplotPromise = null; reject(new Error("couldn't load the graph library (offline?)")); };
+    document.head.appendChild(js);
+  });
+  return uplotPromise;
+}
+
+function setDevMode(on) {
+  $("dev").hidden = !on;
+  $("devMode").checked = on;
+  store("devMode", on ? "1" : "0");
+  if (on) loadUPlot().catch((e) => log(e.message));
+  if (on && devSource && !devDecoded) devRender();
+}
+
+function rangeKey(tagNum) { return "range:" + (tagNum || "none"); }
+
+function devSetSource(bytes, tagNum, label) {
+  devSource = { bytes, tagNum, label };
+  devDecoded = null;
+  const saved = store(rangeKey(tagNum));
+  if (saved && RANGE_SENSITIVITY[saved]) $("devRange").value = saved;
+  $("devSrc").textContent = `Source: ${label}${tagNum ? ` — tag #${tagNum}` : ""}`;
+  if (!$("dev").hidden) devRender();
+}
+
+function iosLike() {
+  return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+         (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+}
+
+async function offerFile(content, name, type) {
+  const file = new File([content], name, { type });
+  let canShare = false;
+  try { canShare = !!(navigator.canShare && navigator.canShare({ files: [file] })); } catch (_) { /* no */ }
+  if (iosLike() && canShare) {
+    try { await navigator.share({ files: [file], title: name }); }
+    catch (e) { if (e.name !== "AbortError") log(`Share failed: ${e.message}`); }
+    return;
+  }
+  const url = URL.createObjectURL(file);
+  const a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+  log(`${name} handed to the browser`);
+}
+
+async function devRender() {
+  if (!devSource) return;
+  const g = Number($("devRange").value);
+  const k = mgPerCount(g);
+  const sum = $("devSummary");
+  sum.className = "dev-summary";
+  try {
+    devDecoded = devDecoded || decodeLog(devSource.bytes);
+  } catch (e) {
+    devDecoded = null;
+    sum.className = "dev-summary err";
+    sum.textContent = `Can't decode: ${e.message}`;
+    $("devCsv").disabled = true;
+    $("devTableWrap").hidden = true;
+    if (devPlot) { devPlot.destroy(); devPlot = null; }
+    $("chartNote").hidden = true;
+    return;
+  }
+  const { header, bursts, notes } = devDecoded;
+
+  /* Summary */
+  let failed = 0;
+  const gaps = [];
+  bursts.forEach((b, i) => {
+    for (let j = 0; j < SAMPLES_PER_BURST; j++) {
+      const s = b.samples;
+      if (s[j * 3] === FAILED_READ && s[j * 3 + 1] === FAILED_READ && s[j * 3 + 2] === FAILED_READ) failed++;
+    }
+    const p = bursts[i - 1];
+    if (p && p.boot === b.boot && b.sequence !== p.sequence + 1) gaps.push(`${p.sequence}→${b.sequence}`);
+  });
+  const boots = bursts.length ? bursts[bursts.length - 1].boot + 1 : 0;
+  const bytesTotal = bursts.reduce((n, b) => n + b.length, 0);
+  sum.textContent =
+    `Log header: session ${header.session}, boot_count ${header.boot_count}, started at ${header.timestamp} s uptime, ` +
+    `reset cause 0x${header.reset_cause.toString(16)}\n` +
+    `${bursts.length} bursts in ${boots} boot(s), ${bursts.length * SAMPLES_PER_BURST} samples, ${failed} failed reads` +
+    (bursts.length ? `, avg ${Math.round(bytesTotal / bursts.length)} B/burst` : "") +
+    `\nRange ±${g} g → ${k.toFixed(3)} mg per count` +
+    (gaps.length ? `\nSequence gaps (lost bursts): ${gaps.join(", ")}` : "") +
+    (notes.length ? `\nNote: ${notes.join("; ")}` : "");
+
+  /* Table */
+  const rows = bursts.map((b) =>
+    `<tr><td>${b.boot}</td><td>${b.sequence}</td><td>${(b.timestamp_ms / 1000).toFixed(1)}</td><td>${b.length}</td>` +
+    `<td>${b.widths.join("/")}</td><td>${b.failed_reads}</td><td>${b.failed_writes}</td><td>${b.restarted ? "yes" : ""}</td></tr>`).join("");
+  $("devTable").innerHTML =
+    `<table><thead><tr><th>boot</th><th>seq</th><th>t (s)</th><th>bytes</th><th>widths</th><th>rd</th><th>wr</th><th>restart</th></tr></thead>` +
+    `<tbody>${rows}</tbody></table>`;
+  $("devTableSummary").textContent = `Bursts (${bursts.length})`;
+  $("devTableWrap").hidden = false;
+  $("devCsv").disabled = bursts.length === 0;
+
+  /* Graph */
+  try { await loadUPlot(); } catch (e) { log(e.message); return; }
+  devDrawChart(bursts, k);
+}
+
+function devDrawChart(bursts, k) {
+  /* x: seconds. Within a boot it's uptime; after a reboot the clock restarts,
+   * so the next boot is placed 60 s after the last burst and marked. */
+  const xs = [], X = [], Y = [], Z = [], M = [], reboots = [];
+  let offset = 0, prevEnd = null;
+  for (let bi = 0; bi < bursts.length; bi++) {
+    const b = bursts[bi];
+    const t0 = b.timestamp_ms / 1000;
+    if (bi > 0 && b.boot !== bursts[bi - 1].boot) {
+      reboots.push(prevEnd + 25);
+      offset = prevEnd + 60 - t0;
+    }
+    const s = b.samples;
+    for (let i = 0; i < SAMPLES_PER_BURST; i++) {
+      xs.push(offset + t0 + (i + 1) * 0.1);
+      const x = s[i * 3], y = s[i * 3 + 1], z = s[i * 3 + 2];
+      if (x === FAILED_READ && y === FAILED_READ && z === FAILED_READ) {
+        X.push(null); Y.push(null); Z.push(null); M.push(null);
+      } else {
+        const xm = x * k, ym = y * k, zm = z * k;
+        X.push(xm); Y.push(ym); Z.push(zm); M.push(Math.sqrt(xm * xm + ym * ym + zm * zm));
+      }
+    }
+    /* break the line between bursts */
+    xs.push(offset + t0 + 10.05); X.push(null); Y.push(null); Z.push(null); M.push(null);
+    prevEnd = offset + t0 + 10;
+  }
+
+  if (devPlot) { devPlot.destroy(); devPlot = null; }
+  const el = $("chart");
+  if (!xs.length) { $("chartNote").hidden = true; return; }
+
+  const css = getComputedStyle(document.documentElement);
+  const c = (n) => css.getPropertyValue(n).trim();
+  const axis = (label) => ({
+    label, stroke: c("--muted"),
+    grid: { stroke: c("--border"), width: 1 },
+    ticks: { stroke: c("--border"), width: 1 },
+  });
+  const fmt = (u, v) => (v == null ? "–" : v.toFixed(0));
+  const opts = {
+    width: Math.max(280, el.clientWidth),
+    height: Math.min(360, Math.max(240, Math.round(el.clientWidth * 0.6))),
+    scales: { x: { time: false } },
+    series: [
+      { label: "t (s)", value: (u, v) => (v == null ? "–" : v.toFixed(1)) },
+      { label: "x mg", stroke: c("--c-x"), width: 1, value: fmt },
+      { label: "y mg", stroke: c("--c-y"), width: 1, value: fmt },
+      { label: "z mg", stroke: c("--c-z"), width: 1, value: fmt },
+      { label: "|a| mg", stroke: c("--c-mag"), width: 1, value: fmt },
+    ],
+    axes: [axis("time (s)"), axis("mg")],
+    cursor: { drag: { x: true, y: false } },
+    hooks: {
+      draw: [(u) => {
+        const ctx = u.ctx;
+        ctx.save();
+        ctx.strokeStyle = c("--danger");
+        ctx.lineWidth = 1.5 * devicePixelRatio;
+        ctx.setLineDash([6 * devicePixelRatio, 4 * devicePixelRatio]);
+        for (const r of reboots) {
+          const px = u.valToPos(r, "x", true);
+          if (px < u.bbox.left || px > u.bbox.left + u.bbox.width) continue;
+          ctx.beginPath();
+          ctx.moveTo(px, u.bbox.top);
+          ctx.lineTo(px, u.bbox.top + u.bbox.height);
+          ctx.stroke();
+        }
+        ctx.restore();
+      }],
+    },
+  };
+  devPlot = new uPlot(opts, [xs, X, Y, Z, M], el);
+  $("chartNote").hidden = false;
+}
+
+function devCsv() {
+  if (!devDecoded) return;
+  const k = mgPerCount(Number($("devRange").value));
+  const lines = ["boot,seq,sample,t_s,x_mg,y_mg,z_mg,failed"];
+  for (const b of devDecoded.bursts) {
+    const s = b.samples;
+    for (let i = 0; i < SAMPLES_PER_BURST; i++) {
+      const t = ((b.timestamp_ms + (i + 1) * 100) / 1000).toFixed(1);
+      const x = s[i * 3], y = s[i * 3 + 1], z = s[i * 3 + 2];
+      if (x === FAILED_READ && y === FAILED_READ && z === FAILED_READ) {
+        lines.push(`${b.boot},${b.sequence},${i},${t},,,,1`);
+      } else {
+        lines.push(`${b.boot},${b.sequence},${i},${t},${(x * k).toFixed(1)},${(y * k).toFixed(1)},${(z * k).toFixed(1)},0`);
+      }
+    }
+  }
+  const base = (devSource.label.match(/BLE_TAG[^ )]*?(?=\.bin|\)|$)/) || ["BLE_TAG"])[0].replace(/\.bin$/, "");
+  offerFile(lines.join("\n") + "\n", `${base}_${$("devRange").value}g.csv`, "text/csv");
+}
+
 /* ---- Wire up ------------------------------------------------------------- */
 if (!navigator.bluetooth) {
   $("unsupported").hidden = false;
@@ -518,6 +913,28 @@ $("btnConnect").addEventListener("click", connect);
 $("btnDownload").addEventListener("click", download);
 $("btnDelete").addEventListener("click", deleteLog);
 $("btnDisconnect").addEventListener("click", disconnect);
+
+$("devMode").addEventListener("change", (e) => setDevMode(e.target.checked));
+$("devRange").addEventListener("change", () => {
+  if (devSource) store(rangeKey(devSource.tagNum), $("devRange").value);
+  devRender();
+});
+$("devFile").addEventListener("change", async (e) => {
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  const bytes = new Uint8Array(await f.arrayBuffer());
+  const m = f.name.match(/^BLE_TAG-(\d+)_/);
+  devSetSource(bytes, m ? m[1] : "", f.name);
+  e.target.value = "";
+});
+$("devCsv").addEventListener("click", devCsv);
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => { if (devPlot) devRender(); }, 200);
+});
+setDevMode(store("devMode") === "1" || new URLSearchParams(location.search).get("dev") === "1");
+
 updateButtons();
 </script>
 </body>
