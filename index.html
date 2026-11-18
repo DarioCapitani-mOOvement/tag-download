@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tag Log Download</title>
+<meta name="description" content="Download or clear the accelerometer log of a BLE_TAG over Web Bluetooth.">
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --text: #1b1f24;
+    --muted: #5b6470;
+    --border: #d9dde3;
+    --accent: #1f6feb;
+    --accent-text: #ffffff;
+    --danger: #c62828;
+    --danger-text: #ffffff;
+    --ok: #1a7f37;
+    --warn-bg: #fff4d6;
+    --warn-text: #6b4e00;
+    --mono-bg: #f0f2f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1216;
+      --card: #171b21;
+      --text: #e6e9ee;
+      --muted: #9aa3ae;
+      --border: #2a3039;
+      --accent: #4c8dff;
+      --accent-text: #0b1220;
+      --danger: #ef5350;
+      --danger-text: #1a0606;
+      --ok: #3fb950;
+      --warn-bg: #3a2f10;
+      --warn-text: #f5d77a;
+      --mono-bg: #11151a;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1216;
+    --card: #171b21;
+    --text: #e6e9ee;
+    --muted: #9aa3ae;
+    --border: #2a3039;
+    --accent: #4c8dff;
+    --accent-text: #0b1220;
+    --danger: #ef5350;
+    --danger-text: #1a0606;
+    --ok: #3fb950;
+    --warn-bg: #3a2f10;
+    --warn-text: #f5d77a;
+    --mono-bg: #11151a;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 560px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 1.35rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: 0.95rem; }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .warn {
+    background: var(--warn-bg);
+    color: var(--warn-text);
+    border-radius: 10px;
+    padding: 12px 14px;
+    margin-bottom: 16px;
+    font-size: 0.95rem;
+  }
+  .warn[hidden] { display: none; }
+
+  .tag-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .tag-name { font-size: 1.15rem; font-weight: 600; word-break: break-all; }
+  .tag-num { color: var(--muted); font-size: 0.95rem; white-space: nowrap; }
+  .status { margin-top: 6px; color: var(--muted); font-size: 0.95rem; min-height: 1.4em; }
+  .status.ok { color: var(--ok); }
+  .status.err { color: var(--danger); }
+
+  .buttons { display: grid; gap: 10px; margin-top: 14px; }
+  button {
+    font: inherit;
+    font-weight: 600;
+    padding: 12px 14px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    color: var(--text);
+    cursor: pointer;
+    width: 100%;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button.danger { background: var(--danger); border-color: var(--danger); color: var(--danger-text); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 14px; }
+  .stat { background: var(--mono-bg); border-radius: 8px; padding: 8px 10px; }
+  .stat .k { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; }
+  .stat .v { font-variant-numeric: tabular-nums; font-weight: 600; }
+
+  .header-info { margin-top: 10px; font-size: 0.9rem; color: var(--muted); }
+  .save-again { margin-top: 10px; font-size: 0.9rem; }
+  .save-again a { color: var(--accent); }
+
+  details { margin-top: 4px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 0.9rem; }
+  #log {
+    margin: 8px 0 0;
+    background: var(--mono-bg);
+    border-radius: 8px;
+    padding: 10px;
+    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    max-height: 220px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Tag log download</h1>
+  <p class="sub">Connect to a <code>BLE_TAG</code>, save its accelerometer log as a <code>.bin</code>, or clear the log.</p>
+
+  <div class="warn" id="unsupported" hidden>
+    This browser can't use Bluetooth. Use <b>Chrome</b> or <b>Edge</b> on Android, Windows, macOS or ChromeOS.
+    On iPhone/iPad, use the <b>Bluefy</b> browser app. On Linux Chrome, you may need to turn on
+    <code>chrome://flags/#enable-experimental-web-platform-features</code>.
+  </div>
+
+  <div class="card">
+    <div class="tag-row">
+      <div class="tag-name" id="tagName">No tag connected</div>
+      <div class="tag-num" id="tagNum"></div>
+    </div>
+    <div class="status" id="status">Press Connect and pick the tag from the list.</div>
+
+    <div class="buttons">
+      <button class="primary" id="btnConnect">Connect to tag</button>
+      <button id="btnDownload" disabled>Download log (.bin)</button>
+      <button class="danger" id="btnDelete" disabled>Delete log on tag</button>
+      <button id="btnDisconnect" disabled>Disconnect</button>
+    </div>
+
+    <div class="stats" id="stats" hidden>
+      <div class="stat"><div class="k">Received</div><div class="v" id="stBytes">0 KB</div></div>
+      <div class="stat"><div class="k">Speed</div><div class="v" id="stRate">–</div></div>
+      <div class="stat"><div class="k">Time</div><div class="v" id="stTime">0 s</div></div>
+    </div>
+    <div class="header-info" id="headerInfo" hidden></div>
+    <div class="save-again" id="saveAgain" hidden></div>
+  </div>
+
+  <details>
+    <summary>Activity log</summary>
+    <pre id="log"></pre>
+  </details>
+</main>
+
+<script>
+"use strict";
+
+/* ---- Tag GATT protocol ------------------------------------------------ */
+const NAME_PREFIX   = "BLE_TAG";                                // matches "BLE_TAG" and "BLE_TAG#12"
+const SERVICE_UUID  = "12345678-1234-5678-1234-56789abcdef1";   // tag service
+const STATUS_UUID   = "12345678-1234-5678-1234-56789abcdef7";   // ACK notifications
+const DOWNLOAD_UUID = "12345678-1234-5678-1234-56789abcdef8";   // subscribe = tag streams its log
+const RESET_UUID    = "12345678-1234-5678-1234-56789abcdef9";   // write 0x01 = clear log
+const SETTING_RESET_LOG = 5;
+const RESET_LOG_MAGIC   = 0x01;
+const DATALOG_MAGIC     = 0xCAFEBABE;
+
+/* There is no end-of-log marker in the download, so it's done when the tag
+ * stops sending for IDLE_MS. */
+const FIRST_CHUNK_TIMEOUT_MS = 8000;
+const IDLE_MS = 3000;
+const ACK_TIMEOUT_MS = 8000;
+
+/* ---- State --------------------------------------------------------------- */
+let device = null;
+let service = null;
+let busy = false;
+let downloadedThisConnection = false;
+let lastBlobUrl = null;
+
+const $ = (id) => document.getElementById(id);
+
+function log(msg) {
+  const t = new Date().toLocaleTimeString();
+  const el = $("log");
+  el.textContent += `[${t}] ${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function setStatus(msg, kind = "") {
+  const el = $("status");
+  el.textContent = msg;
+  el.className = "status" + (kind ? " " + kind : "");
+}
+
+function tagNumber(name) {
+  const i = name ? name.indexOf("#") : -1;
+  return i >= 0 ? name.slice(i + 1) : "";
+}
+
+function updateButtons() {
+  const connected = !!(device && device.gatt.connected && service);
+  $("btnConnect").disabled = busy || connected || !navigator.bluetooth;
+  $("btnDownload").disabled = busy || !connected;
+  $("btnDelete").disabled = busy || !connected;
+  $("btnDisconnect").disabled = busy || !connected;
+}
+
+function showTag() {
+  if (!device) {
+    $("tagName").textContent = "No tag connected";
+    $("tagNum").textContent = "";
+    return;
+  }
+  const name = device.name || "(no name)";
+  const num = tagNumber(name);
+  $("tagName").textContent = name;
+  $("tagNum").textContent = num ? `Tag #${num}` : "no tag number";
+}
+
+function fmtKB(n) { return (n / 1024).toFixed(1) + " KB"; }
+
+/* ---- Connect ------------------------------------------------------------- */
+async function connect() {
+  busy = true; updateButtons();
+  try {
+    setStatus("Choose the tag in the browser's list…");
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: NAME_PREFIX }],
+      optionalServices: [SERVICE_UUID],
+    });
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+    showTag();
+    log(`Selected ${device.name}`);
+
+    setStatus("Connecting…");
+    let server;
+    try {
+      server = await device.gatt.connect();
+    } catch (e) {
+      /* Android sometimes fails the first attempt; one retry usually works. */
+      log(`Connect failed (${e.message}), retrying once`);
+      server = await device.gatt.connect();
+    }
+    service = await server.getPrimaryService(SERVICE_UUID);
+    downloadedThisConnection = false;
+    log("Connected, service found");
+    setStatus("Connected.", "ok");
+  } catch (e) {
+    if (e.name === "NotFoundError") {
+      setStatus("No tag chosen.");          /* user closed the picker */
+    } else {
+      setStatus(`Couldn't connect: ${e.message}`, "err");
+      log(`Connect error: ${e.name}: ${e.message}`);
+    }
+    if (device && device.gatt.connected) device.gatt.disconnect();
+    service = null;
+  } finally {
+    busy = false; updateButtons();
+  }
+}
+
+function onDisconnected() {
+  log("Disconnected");
+  service = null;
+  if (!busy) setStatus("Disconnected.");
+  updateButtons();
+}
+
+function disconnect() {
+  if (device && device.gatt.connected) device.gatt.disconnect();
+  service = null;
+  setStatus("Disconnected.");
+  updateButtons();
+}
+
+/* ---- Download ------------------------------------------------------------ */
+async function download() {
+  busy = true; updateButtons();
+  const chunks = [];
+  let total = 0;
+  let count = 0;
+  let t0 = 0;
+  let lastRx = 0;
+  let ch = null;
+
+  const onChunk = (ev) => {
+    const v = ev.target.value;
+    chunks.push(new Uint8Array(v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength)));
+    total += v.byteLength;
+    count++;
+    lastRx = performance.now();
+  };
+
+  $("stats").hidden = false;
+  $("headerInfo").hidden = true;
+  $("saveAgain").hidden = true;
+
+  try {
+    ch = await service.getCharacteristic(DOWNLOAD_UUID);
+    /* Listener first: the tag starts sending as soon as the CCC is written,
+     * possibly before startNotifications() resolves. */
+    ch.addEventListener("characteristicvaluechanged", onChunk);
+    setStatus("Downloading…");
+    t0 = performance.now();
+    lastRx = 0;
+    await ch.startNotifications();
+    log("Subscribed, tag is sending");
+
+    await new Promise((resolve, reject) => {
+      const timer = setInterval(() => {
+        const now = performance.now();
+        const secs = (now - t0) / 1000;
+        $("stBytes").textContent = fmtKB(total);
+        $("stTime").textContent = secs.toFixed(0) + " s";
+        $("stRate").textContent = secs > 0.5 ? (total / 1024 / secs).toFixed(1) + " KB/s" : "–";
+
+        if (!device.gatt.connected) {
+          clearInterval(timer);
+          total ? resolve() : reject(new Error("tag disconnected"));
+        } else if (lastRx === 0 && now - t0 > FIRST_CHUNK_TIMEOUT_MS) {
+          clearInterval(timer);
+          reject(new Error("the tag sent no data"));
+        } else if (lastRx !== 0 && now - lastRx > IDLE_MS) {
+          clearInterval(timer);
+          resolve();
+        }
+      }, 200);
+    });
+
+    if (device.gatt.connected) {
+      try { await ch.stopNotifications(); } catch (_) { /* ignore */ }
+    }
+
+    const data = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) { data.set(c, off); off += c.length; }
+
+    const secs = ((lastRx || performance.now()) - t0) / 1000;
+    log(`Received ${total} bytes in ${count} notifications, ${secs.toFixed(1)} s`);
+    showLogHeader(data);
+    saveBin(data);
+    downloadedThisConnection = true;
+    setStatus(`Downloaded ${fmtKB(total)}${device.gatt.connected ? "" : " (tag disconnected at the end)"}.`, "ok");
+  } catch (e) {
+    setStatus(`Download failed: ${e.message}`, "err");
+    log(`Download error: ${e.message}`);
+    if (total > 0) {
+      log(`Saving the ${total} bytes received so far`);
+      const data = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) { data.set(c, off); off += c.length; }
+      saveBin(data, "_partial");
+    }
+  } finally {
+    if (ch) ch.removeEventListener("characteristicvaluechanged", onChunk);
+    busy = false; updateButtons();
+  }
+}
+
+/* Log header (16 B, little-endian):
+ * u32 magic, u32 timestamp, u32 reset_cause, u16 boot_count, u8 version, u8 session */
+function showLogHeader(data) {
+  const el = $("headerInfo");
+  if (data.length < 16) { el.hidden = true; return; }
+  const dv = new DataView(data.buffer, data.byteOffset, 16);
+  const magic = dv.getUint32(0, true);
+  if (magic !== DATALOG_MAGIC) {
+    el.textContent = `Log header not recognised (magic 0x${magic.toString(16).toUpperCase().padStart(8, "0")}).`;
+  } else {
+    const boot = dv.getUint16(12, true);
+    const session = dv.getUint8(15);
+    const reset = dv.getUint32(8, true);
+    el.textContent = `Log header: session ${session}, resumed after ${boot} reboot${boot === 1 ? "" : "s"}, ` +
+                     `reset cause 0x${reset.toString(16)}, ${fmtKB(data.length - 16)} of bursts.`;
+  }
+  el.hidden = false;
+}
+
+function fileName(suffix = "") {
+  const name = (device && device.name) || "BLE_TAG";
+  const num = tagNumber(name);
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  const stamp = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}`;
+  return `BLE_TAG${num ? "-" + num : ""}_${stamp}${suffix}.bin`;
+}
+
+function saveBin(data, suffix = "") {
+  if (lastBlobUrl) URL.revokeObjectURL(lastBlobUrl);
+  const blob = new Blob([data], { type: "application/octet-stream" });
+  lastBlobUrl = URL.createObjectURL(blob);
+  const name = fileName(suffix);
+  const a = document.createElement("a");
+  a.href = lastBlobUrl;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+
+  const again = $("saveAgain");
+  again.innerHTML = "";
+  const link = document.createElement("a");
+  link.href = lastBlobUrl;
+  link.download = name;
+  link.textContent = `Save ${name} again`;
+  again.appendChild(link);
+  again.hidden = false;
+  log(`Saved ${name}`);
+}
+
+/* ---- Delete (reset log) ------------------------------------------------- */
+async function deleteLog() {
+  const name = (device && device.name) || "this tag";
+  const warning = downloadedThisConnection
+    ? `Delete the log on ${name}? This can't be undone.`
+    : `You haven't downloaded ${name}'s log yet.\n\nDelete it anyway? This can't be undone.`;
+  if (!confirm(warning)) return;
+
+  busy = true; updateButtons();
+  let statusCh = null;
+  let onAck = null;
+  try {
+    statusCh = await service.getCharacteristic(STATUS_UUID);
+    const resetCh = await service.getCharacteristic(RESET_UUID);
+
+    const ack = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("no reply from the tag")), ACK_TIMEOUT_MS);
+      onAck = (ev) => {
+        const v = ev.target.value;
+        if (v.byteLength < 2 || v.getUint8(0) !== SETTING_RESET_LOG) return;
+        clearTimeout(timer);
+        resolve({
+          status: v.getInt8(1),
+          used: v.byteLength >= 6 ? v.getUint32(2, true) : null,
+        });
+      };
+      statusCh.addEventListener("characteristicvaluechanged", onAck);
+    });
+    ack.catch(() => {});   /* avoid an unhandled rejection if the write itself fails */
+
+    await statusCh.startNotifications();
+    setStatus("Deleting…");
+    await resetCh.writeValueWithResponse(Uint8Array.of(RESET_LOG_MAGIC));
+    log("Reset command sent");
+
+    const r = await ack;
+    if (r.status === 0) {
+      log(`Reset ACK: OK, log now ${r.used} bytes`);
+      downloadedThisConnection = false;
+      setStatus("Log deleted. The tag has started a new session.", "ok");
+    } else {
+      log(`Reset ACK: error ${r.status}`);
+      setStatus(`The tag couldn't clear its log (error ${r.status}).`, "err");
+    }
+  } catch (e) {
+    setStatus(`Delete failed: ${e.message}`, "err");
+    log(`Delete error: ${e.message}`);
+  } finally {
+    if (statusCh && onAck) {
+      statusCh.removeEventListener("characteristicvaluechanged", onAck);
+      if (device && device.gatt.connected) {
+        try { await statusCh.stopNotifications(); } catch (_) { /* ignore */ }
+      }
+    }
+    busy = false; updateButtons();
+  }
+}
+
+/* ---- Wire up ------------------------------------------------------------- */
+if (!navigator.bluetooth) {
+  $("unsupported").hidden = false;
+  setStatus("Bluetooth isn't available in this browser.", "err");
+}
+$("btnConnect").addEventListener("click", connect);
+$("btnDownload").addEventListener("click", download);
+$("btnDelete").addEventListener("click", deleteLog);
+$("btnDisconnect").addEventListener("click", disconnect);
+updateButtons();
+</script>
+</body>
+</html>
