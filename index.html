@@ -417,13 +417,38 @@ function saveBin(data, suffix = "") {
 
   const again = $("saveAgain");
   again.innerHTML = "";
+
+  /* iOS browsers (Bluefy, and Safari's web view in general) can silently
+   * ignore the download link above. The share sheet works there instead:
+   * "Save to Files", AirDrop, Mail... It needs a fresh tap, so it's a button. */
+  const file = new File([data], name, { type: "application/octet-stream" });
+  let canShareFile = false;
+  try { canShareFile = !!(navigator.canShare && navigator.canShare({ files: [file] })); } catch (_) { /* no */ }
+  log(`File sharing ${canShareFile ? "available" : "not available"} in this browser`);
+  if (canShareFile) {
+    const btn = document.createElement("button");
+    btn.className = "primary";
+    btn.textContent = "Share / Save to Files";
+    btn.addEventListener("click", async () => {
+      try {
+        await navigator.share({ files: [file], title: name });
+        log(`Shared ${name}`);
+      } catch (e) {
+        if (e.name !== "AbortError") log(`Share failed: ${e.name}: ${e.message}`);
+      }
+    });
+    again.appendChild(btn);
+  }
+
   const link = document.createElement("a");
   link.href = lastBlobUrl;
   link.download = name;
   link.textContent = `Save ${name} again`;
+  link.style.display = "block";
+  link.style.marginTop = "10px";
   again.appendChild(link);
   again.hidden = false;
-  log(`Saved ${name}`);
+  log(`Download of ${name} handed to the browser`);
 }
 
 /* ---- Delete (reset log) ------------------------------------------------- */
