@@ -137,6 +137,14 @@
 
   .devtoggle { display: flex; align-items: center; gap: 8px; margin-top: 16px; color: var(--muted); font-size: 0.9rem; }
   .dev[hidden] { display: none; }
+  /* Wider than the 560 px column on laptops, centred on the page */
+  @media (min-width: 900px) {
+    .dev {
+      width: min(1200px, calc(100vw - 64px));
+      margin-left: calc((100% - min(1200px, calc(100vw - 64px))) / 2);
+    }
+  }
+  .pan-row input[type="range"] { flex: 1 1 200px; min-width: 0; accent-color: var(--accent); }
   .dev h2 { font-size: 1.05rem; margin: 0 0 10px; }
   .dev-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 10px; }
   .dev-row label { color: var(--muted); font-size: 0.9rem; }
@@ -221,10 +229,23 @@
     <div class="dev-src" id="devSrc">Download a log, or open a saved .bin.</div>
     <div class="dev-summary" id="devSummary"></div>
     <div class="chart-note" id="chartNote" hidden>
-      Drag across the graph to zoom, double-tap/click to reset. Bursts are 10 s every 60 s.
+      Pick a time window under the graph and scroll with the slider (on a laptop also a sideways
+      trackpad swipe or Shift + wheel). Drag across the graph to zoom in further; move the slider to go back.
+      Bursts are 10 s every 60 s.
       Dashed lines are reboots: the clock restarts there, so the time between them is unknown (drawn as 60 s).
     </div>
     <div id="chart"></div>
+    <div class="dev-row pan-row" id="panRow" hidden>
+      <label for="devWindow">Show</label>
+      <select id="devWindow">
+        <option value="0">all</option>
+        <option value="60">1 min</option>
+        <option value="600">10 min</option>
+        <option value="3600" selected>1 h</option>
+        <option value="21600">6 h</option>
+      </select>
+      <input type="range" id="devPan" min="0" max="1000" step="1" value="0" aria-label="Scroll through time">
+    </div>
     <div class="buttons">
       <button id="devCsv" disabled>Export CSV</button>
     </div>
@@ -854,7 +875,8 @@ function devDrawChart(bursts, k, unit) {
 
   if (devPlot) { devPlot.destroy(); devPlot = null; }
   const el = $("chart");
-  if (!xs.length) { $("chartNote").hidden = true; return; }
+  if (!xs.length) { $("chartNote").hidden = true; $("panRow").hidden = true; return; }
+  devXRange = [xs[0], xs[xs.length - 1]];
 
   const css = getComputedStyle(document.documentElement);
   const c = (n) => css.getPropertyValue(n).trim();
@@ -864,9 +886,11 @@ function devDrawChart(bursts, k, unit) {
     ticks: { stroke: c("--border"), width: 1 },
   });
   const fmt = (u, v) => (v == null ? "–" : v.toFixed(unit.dp));
+  const w = Math.max(280, el.clientWidth);
+  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, Math.round(v)));
   const opts = {
-    width: Math.max(280, el.clientWidth),
-    height: Math.min(360, Math.max(240, Math.round(el.clientWidth * 0.6))),
+    width: w,
+    height: w >= 700 ? clamp(w * 0.42, 300, 520) : clamp(w * 0.6, 240, 360),
     scales: { x: { time: false } },
     series: [
       { label: "t (s)", value: (u, v) => (v == null ? "–" : v.toFixed(1)) },
@@ -898,6 +922,43 @@ function devDrawChart(bursts, k, unit) {
   };
   devPlot = new uPlot(opts, [xs, X, Y, Z, M], el);
   $("chartNote").hidden = false;
+  $("panRow").hidden = false;
+  applyWindow();
+}
+
+/* ---- Scrolling through time: a fixed window moved by the slider ---------- */
+let devXRange = null;     /* [first x, last x] of the plotted data */
+
+function applyWindow() {
+  if (!devPlot || !devXRange) return;
+  const [lo, hi] = devXRange;
+  const span = hi - lo;
+  const win = Number($("devWindow").value);
+  const pan = $("devPan");
+  if (!win || win >= span) {
+    pan.disabled = true;
+    devPlot.setScale("x", { min: lo, max: hi });
+    return;
+  }
+  pan.disabled = false;
+  const start = lo + (span - win) * (Number(pan.value) / Number(pan.max));
+  devPlot.setScale("x", { min: start, max: start + win });
+}
+
+/* Horizontal trackpad swipe or Shift+wheel over the graph scrolls it; a plain
+ * vertical wheel still scrolls the page. */
+function onChartWheel(e) {
+  const pan = $("devPan");
+  if (pan.disabled) return;
+  const dx = e.shiftKey ? (e.deltaX || e.deltaY) : e.deltaX;
+  if (!dx || Math.abs(dx) < Math.abs(e.shiftKey ? 0 : e.deltaY)) return;
+  e.preventDefault();
+  const [lo, hi] = devXRange;
+  const win = Number($("devWindow").value);
+  /* move by a fraction of the window per wheel step */
+  const steps = (dx / 100) * (win * 0.25) / (hi - lo - win) * Number(pan.max);
+  pan.value = String(Math.min(Number(pan.max), Math.max(0, Number(pan.value) + steps)));
+  applyWindow();
 }
 
 function devCsv() {
@@ -955,6 +1016,13 @@ $("devFile").addEventListener("change", async (e) => {
   e.target.value = "";
 });
 $("devCsv").addEventListener("click", devCsv);
+{
+  const savedWin = store("window");
+  if (savedWin !== null && [...$("devWindow").options].some((o) => o.value === savedWin)) $("devWindow").value = savedWin;
+}
+$("devWindow").addEventListener("change", () => { store("window", $("devWindow").value); applyWindow(); });
+$("devPan").addEventListener("input", applyWindow);
+$("chart").addEventListener("wheel", onChartWheel, { passive: false });
 let resizeTimer = null;
 window.addEventListener("resize", () => {
   clearTimeout(resizeTimer);
