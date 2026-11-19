@@ -207,6 +207,12 @@
         <option value="8" selected>±8 g</option>
         <option value="16">±16 g</option>
       </select>
+      <label for="devUnit">Unit</label>
+      <select id="devUnit">
+        <option value="ms2" selected>m/s²</option>
+        <option value="g">g</option>
+        <option value="mg">mg</option>
+      </select>
     </div>
     <div class="dev-row">
       <label for="devFile">Open a saved .bin</label>
@@ -674,6 +680,14 @@ function mgPerCount(g) {
   return um / 9806.65;
 }
 
+/* Display units: factor from mg. 1 g = 9.80665 m/s^2 (standard gravity). */
+const UNITS = {
+  ms2: { f: 0.00980665, label: "m/s²", dp: 2, csv: "ms2" },
+  g:   { f: 0.001,      label: "g",    dp: 3, csv: "g" },
+  mg:  { f: 1,          label: "mg",   dp: 0, csv: "mg" },
+};
+function currentUnit() { return UNITS[$("devUnit").value] || UNITS.ms2; }
+
 /* ---- Developer mode: UI -------------------------------------------------- */
 const UPLOT_JS  = "https://cdn.jsdelivr.net/npm/uplot@1.6.30/dist/uPlot.iife.min.js";
 const UPLOT_CSS = "https://cdn.jsdelivr.net/npm/uplot@1.6.30/dist/uPlot.min.css";
@@ -788,7 +802,7 @@ async function devRender() {
     `reset cause 0x${header.reset_cause.toString(16)}\n` +
     `${bursts.length} bursts in ${boots} boot(s), ${bursts.length * SAMPLES_PER_BURST} samples, ${failed} failed reads` +
     (bursts.length ? `, avg ${Math.round(bytesTotal / bursts.length)} B/burst` : "") +
-    `\nRange ±${g} g → ${k.toFixed(3)} mg per count` +
+    `\nRange ±${g} g → ${k.toFixed(3)} mg (${(k * UNITS.ms2.f).toFixed(4)} m/s²) per count` +
     (gaps.length ? `\nSequence gaps (lost bursts): ${gaps.join(", ")}` : "") +
     (notes.length ? `\nNote: ${notes.join("; ")}` : "");
 
@@ -805,10 +819,12 @@ async function devRender() {
 
   /* Graph */
   try { await loadUPlot(); } catch (e) { log(e.message); return; }
-  devDrawChart(bursts, k);
+  const unit = currentUnit();
+  devDrawChart(bursts, k * unit.f, unit);
 }
 
-function devDrawChart(bursts, k) {
+/* k: display units per count */
+function devDrawChart(bursts, k, unit) {
   /* x: seconds. Within a boot it's uptime; after a reboot the clock restarts,
    * so the next boot is placed 60 s after the last burst and marked. */
   const xs = [], X = [], Y = [], Z = [], M = [], reboots = [];
@@ -847,19 +863,19 @@ function devDrawChart(bursts, k) {
     grid: { stroke: c("--border"), width: 1 },
     ticks: { stroke: c("--border"), width: 1 },
   });
-  const fmt = (u, v) => (v == null ? "–" : v.toFixed(0));
+  const fmt = (u, v) => (v == null ? "–" : v.toFixed(unit.dp));
   const opts = {
     width: Math.max(280, el.clientWidth),
     height: Math.min(360, Math.max(240, Math.round(el.clientWidth * 0.6))),
     scales: { x: { time: false } },
     series: [
       { label: "t (s)", value: (u, v) => (v == null ? "–" : v.toFixed(1)) },
-      { label: "x mg", stroke: c("--c-x"), width: 1, value: fmt },
-      { label: "y mg", stroke: c("--c-y"), width: 1, value: fmt },
-      { label: "z mg", stroke: c("--c-z"), width: 1, value: fmt },
-      { label: "|a| mg", stroke: c("--c-mag"), width: 1, value: fmt },
+      { label: `x ${unit.label}`, stroke: c("--c-x"), width: 1, value: fmt },
+      { label: `y ${unit.label}`, stroke: c("--c-y"), width: 1, value: fmt },
+      { label: `z ${unit.label}`, stroke: c("--c-z"), width: 1, value: fmt },
+      { label: `|a| ${unit.label}`, stroke: c("--c-mag"), width: 1, value: fmt },
     ],
-    axes: [axis("time (s)"), axis("mg")],
+    axes: [axis("time (s)"), axis(unit.label)],
     cursor: { drag: { x: true, y: false } },
     hooks: {
       draw: [(u) => {
@@ -886,8 +902,11 @@ function devDrawChart(bursts, k) {
 
 function devCsv() {
   if (!devDecoded) return;
-  const k = mgPerCount(Number($("devRange").value));
-  const lines = ["boot,seq,sample,t_s,x_mg,y_mg,z_mg,failed"];
+  const unit = currentUnit();
+  const k = mgPerCount(Number($("devRange").value)) * unit.f;
+  const dp = unit.dp + 1;
+  const u = unit.csv;
+  const lines = [`boot,seq,sample,t_s,x_${u},y_${u},z_${u},failed`];
   for (const b of devDecoded.bursts) {
     const s = b.samples;
     for (let i = 0; i < SAMPLES_PER_BURST; i++) {
@@ -896,12 +915,12 @@ function devCsv() {
       if (x === FAILED_READ && y === FAILED_READ && z === FAILED_READ) {
         lines.push(`${b.boot},${b.sequence},${i},${t},,,,1`);
       } else {
-        lines.push(`${b.boot},${b.sequence},${i},${t},${(x * k).toFixed(1)},${(y * k).toFixed(1)},${(z * k).toFixed(1)},0`);
+        lines.push(`${b.boot},${b.sequence},${i},${t},${(x * k).toFixed(dp)},${(y * k).toFixed(dp)},${(z * k).toFixed(dp)},0`);
       }
     }
   }
   const base = (devSource.label.match(/BLE_TAG[^ )]*?(?=\.bin|\)|$)/) || ["BLE_TAG"])[0].replace(/\.bin$/, "");
-  offerFile(lines.join("\n") + "\n", `${base}_${$("devRange").value}g.csv`, "text/csv");
+  offerFile(lines.join("\n") + "\n", `${base}_${$("devRange").value}g_${u}.csv`, "text/csv");
 }
 
 /* ---- Wire up ------------------------------------------------------------- */
@@ -917,6 +936,14 @@ $("btnDisconnect").addEventListener("click", disconnect);
 $("devMode").addEventListener("change", (e) => setDevMode(e.target.checked));
 $("devRange").addEventListener("change", () => {
   if (devSource) store(rangeKey(devSource.tagNum), $("devRange").value);
+  devRender();
+});
+{
+  const savedUnit = store("unit");
+  if (savedUnit && UNITS[savedUnit]) $("devUnit").value = savedUnit;
+}
+$("devUnit").addEventListener("change", () => {
+  store("unit", $("devUnit").value);
   devRender();
 });
 $("devFile").addEventListener("change", async (e) => {
