@@ -208,7 +208,7 @@
   <div class="card dev" id="dev" hidden>
     <h2>Decode &amp; graph</h2>
     <div class="dev-row">
-      <label for="devRange" title="Only used for logs from older LIS2DH12 tags; LIS2DW12 logs record their own range">Range (LIS2DH12 tags)</label>
+      <label for="devRange">Accelerometer range</label>
       <select id="devRange">
         <option value="2">±2 g</option>
         <option value="4">±4 g</option>
@@ -849,8 +849,10 @@ async function devRender() {
   const bytesTotal = bursts.reduce((n, b) => n + b.length, 0);
   const samplesTotal = bursts.reduce((n, b) => n + b.n, 0);
   const range = describeRange(bursts, g);
-  /* The menu only matters for LIS2DH12 bursts (format 0) */
+  /* Logs that record their range show it in the menu, locked; only LIS2DH12
+   * logs (format 0) need it picked by hand. */
   $("devRange").disabled = bursts.length > 0 && !range.usesMenu;
+  if ($("devRange").disabled && range.tag !== "mixed") $("devRange").value = range.tag.replace("g", "");
   sum.textContent =
     `Log header: session ${header.session}, boot_count ${header.boot_count}, started at ${header.timestamp} s uptime, ` +
     `reset cause 0x${header.reset_cause.toString(16)}\n` +
