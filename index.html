@@ -607,7 +607,11 @@ async function deleteLog() {
  * 12-bit-wrap deltas per axis at wx/wy/wz bits), 0xFF padding to a multiple
  * of 16. The format gives N, the time between samples and, for the LIS2DW12,
  * the scale; format 0 (LIS2DH12) doesn't record its range, so the range menu
- * sets it. A probe dump ends with F0 0D BA BE x4; a download just ends. */
+ * sets it. A probe dump ends with F0 0D BA BE x4; a download just ends.
+ * Formats 0-5 are bursts once a minute: the timestamp is uptime when the burst
+ * started and its first read is one period later. Formats 6-9 log continuously:
+ * the timestamp is the first sample's index x 80 ms, so records join up
+ * exactly, and failed_reads 0xFF means the FIFO overran (samples missing). */
 // DECODER-BEGIN
 const END_MARKER = [0xF0, 0x0D, 0xBA, 0xBE, 0xF0, 0x0D, 0xBA, 0xBE,
                     0xF0, 0x0D, 0xBA, 0xBE, 0xF0, 0x0D, 0xBA, 0xBE];
@@ -620,7 +624,14 @@ const FORMATS = {
   3: { n: 100, period_ms: 100, mg: 1.952, chip: "LIS2DW12", g: 4 },
   4: { n: 100, period_ms: 100, mg: 3.904, chip: "LIS2DW12", g: 8 },
   5: { n: 100, period_ms: 100, mg: 7.808, chip: "LIS2DW12", g: 16 },
+  6: { n: 125, period_ms: 80,  mg: 0.976, chip: "LIS2DW12", g: 2,  continuous: true },
+  7: { n: 125, period_ms: 80,  mg: 1.952, chip: "LIS2DW12", g: 4,  continuous: true },
+  8: { n: 125, period_ms: 80,  mg: 3.904, chip: "LIS2DW12", g: 8,  continuous: true },
+  9: { n: 125, period_ms: 80,  mg: 7.808, chip: "LIS2DW12", g: 16, continuous: true },
 };
+/* Time of sample i in a burst, in s (in the burst formats the first read came
+ * one period after the timestamp; in the continuous ones it is at it) */
+function sampleTime(b, i) { return (b.timestamp_ms + (i + b.first_offset) * b.period_ms) / 1000; }
 const BURST_HEADER_SIZE = 14;
 const FAILED_READ = -2048;
 
@@ -691,6 +702,7 @@ function decodeLog(bytes) {
     bursts.push({
       offset: off, timestamp_ms: ts, sequence: seq, length, widths: w,
       format: fmt, n: f.n, period_ms: f.period_ms, mg: f.mg,
+      first_offset: f.continuous ? 0 : 1,
       failed_reads: dv.getUint8(off + 10), failed_writes: dv.getUint8(off + 11),
       restarted: dv.getUint8(off + 12) === 0xFF, temperature: dv.getInt8(off + 13),
       samples: decodeBurst(bytes, off + BURST_HEADER_SIZE, w, f.n),
@@ -724,7 +736,8 @@ function describeRange(bursts, g) {
     const f = FORMATS[fmt];
     return f.mg != null
       ? `${f.chip} ±${f.g} g (from the log) → ${f.mg.toFixed(3)} mg (${(f.mg * UNITS.ms2.f).toFixed(4)} m/s²) per count` +
-        (f.period_ms !== 100 ? `, ${f.n} samples ${f.period_ms} ms apart` : "")
+        (f.continuous ? `, continuous, ${f.period_ms} ms between samples`
+          : f.period_ms !== 100 ? `, ${f.n} samples ${f.period_ms} ms apart` : "")
       : `${f.chip} ±${g} g (from the menu) → ${mgPerCount(g).toFixed(3)} mg (${(mgPerCount(g) * UNITS.ms2.f).toFixed(4)} m/s²) per count`;
   });
   const gs = [...new Set(seen.map((fmt) => FORMATS[fmt].g || g))];
@@ -865,7 +878,8 @@ async function devRender() {
   /* Table */
   const rows = bursts.map((b) =>
     `<tr><td>${b.boot}</td><td>${b.sequence}</td><td>${(b.timestamp_ms / 1000).toFixed(1)}</td><td>${b.length}</td>` +
-    `<td>${b.widths.join("/")}</td><td>${b.failed_reads}</td><td>${b.failed_writes}</td><td>${b.restarted ? "yes" : ""}</td></tr>`).join("");
+    `<td>${b.widths.join("/")}</td><td>${b.first_offset === 0 && b.failed_reads === 0xFF ? "overrun" : b.failed_reads}</td>` +
+    `<td>${b.failed_writes}</td><td>${b.restarted ? "yes" : ""}</td></tr>`).join("");
   $("devTable").innerHTML =
     `<table><thead><tr><th>boot</th><th>seq</th><th>t (s)</th><th>bytes</th><th>widths</th><th>rd</th><th>wr</th><th>restart</th></tr></thead>` +
     `<tbody>${rows}</tbody></table>`;
@@ -881,21 +895,21 @@ async function devRender() {
 
 /* g: menu range, used for LIS2DH12 bursts only */
 function devDrawChart(bursts, g, unit) {
-  /* x: seconds. Within a boot it's uptime; after a reboot the clock restarts,
-   * so the next boot is placed 60 s after the last burst and marked. */
+  /* x: seconds. Within a boot it's the log's clock; after a reboot the clock
+   * restarts, so the next boot is placed 60 s after the last burst and marked. */
   const xs = [], X = [], Y = [], Z = [], M = [], reboots = [];
   let offset = 0, prevEnd = null;
   for (let bi = 0; bi < bursts.length; bi++) {
     const b = bursts[bi];
-    const t0 = b.timestamp_ms / 1000;
+    const t0 = sampleTime(b, 0);
     if (bi > 0 && b.boot !== bursts[bi - 1].boot) {
       reboots.push(prevEnd + 25);
       offset = prevEnd + 60 - t0;
     }
     const s = b.samples;
-    const k = burstMg(b, g) * unit.f, dt = b.period_ms / 1000, dur = b.n * dt;
+    const k = burstMg(b, g) * unit.f, dt = b.period_ms / 1000;
     for (let i = 0; i < b.n; i++) {
-      xs.push(offset + t0 + (i + 1) * dt);
+      xs.push(offset + sampleTime(b, i));
       const x = s[i * 3], y = s[i * 3 + 1], z = s[i * 3 + 2];
       if (x === FAILED_READ && y === FAILED_READ && z === FAILED_READ) {
         X.push(null); Y.push(null); Z.push(null); M.push(null);
@@ -904,9 +918,14 @@ function devDrawChart(bursts, g, unit) {
         X.push(xm); Y.push(ym); Z.push(zm); M.push(Math.sqrt(xm * xm + ym * ym + zm * zm));
       }
     }
-    /* break the line between bursts */
-    xs.push(offset + t0 + dur + 0.05); X.push(null); Y.push(null); Z.push(null); M.push(null);
-    prevEnd = offset + t0 + dur;
+    /* Break the line where time jumps: between bursts, but not between
+     * continuous records where the next one starts one period after this one's
+     * last sample (a break there would also put x out of order). */
+    const last = sampleTime(b, b.n - 1), next = bursts[bi + 1];
+    const joins = next && next.boot === b.boot &&
+      Math.abs(sampleTime(next, 0) - (last + dt)) < dt / 2;
+    if (!joins) { xs.push(offset + last + 0.05); X.push(null); Y.push(null); Z.push(null); M.push(null); }
+    prevEnd = offset + last;
   }
 
   if (devPlot) { devPlot.destroy(); devPlot = null; }
@@ -929,7 +948,7 @@ function devDrawChart(bursts, g, unit) {
     height: w >= 700 ? clamp(w * 0.42, 300, 520) : clamp(w * 0.6, 240, 360),
     scales: { x: { time: false } },
     series: [
-      { label: "t (s)", value: (u, v) => (v == null ? "–" : v.toFixed(1)) },
+      { label: "t (s)", value: (u, v) => (v == null ? "–" : v.toFixed(2)) },
       { label: `x ${unit.label}`, stroke: c("--c-x"), width: 1, value: fmt },
       { label: `y ${unit.label}`, stroke: c("--c-y"), width: 1, value: fmt },
       { label: `z ${unit.label}`, stroke: c("--c-z"), width: 1, value: fmt },
@@ -1008,7 +1027,7 @@ function devCsv() {
     const s = b.samples;
     const k = burstMg(b, g) * unit.f;
     for (let i = 0; i < b.n; i++) {
-      const t = ((b.timestamp_ms + (i + 1) * b.period_ms) / 1000).toFixed(2);
+      const t = sampleTime(b, i).toFixed(2);
       const x = s[i * 3], y = s[i * 3 + 1], z = s[i * 3 + 2];
       if (x === FAILED_READ && y === FAILED_READ && z === FAILED_READ) {
         lines.push(`${b.boot},${b.sequence},${i},${t},,,,1`);
